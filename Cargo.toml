@@ -1,0 +1,9 @@
+[package]
+name = "beanstalk-rs"
+version = "0.0.0"
+edition = "2021"
+description = "A Rust implementation of a beanstalkd-compatible work queue"
+repository = "https://github.com/SeanGeb/beanstalk-rs"
+license = "GPL-3.0-or-later"
+
+[dependencies]
