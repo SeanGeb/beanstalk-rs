@@ -47,7 +47,7 @@ impl codec::Decoder for Decoder {
                     .iter()
                     .take(224) // inspect at most 224 bytes
                     .tuple_windows() // in pairs
-                    .find_position(|(&a, &b)| a == b'\r' && b == b'\n')
+                    .find_position(|&(&a, &b)| a == b'\r' && b == b'\n')
                 {
                     Some((idx, _)) => {
                         // Panic safety: split_to panics unless src.len() >= idx.
@@ -135,7 +135,7 @@ impl codec::Decoder for Decoder {
                 if let Some((idx, _)) = src
                     .iter()
                     .tuple_windows()
-                    .find_position(|(&a, &b)| a == b'\r' && b == b'\n')
+                    .find_position(|&(&a, &b)| a == b'\r' && b == b'\n')
                 {
                     // Remove everything up to and including the \r\n, then try
                     // to return to normal parsing.
