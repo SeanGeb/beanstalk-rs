@@ -1,32 +1,6 @@
 //! implements a parser for the beanstalkd TCP protocol.
-use std::fmt;
 
-use crate::types::protocol::BeanstalkCommand;
-use crate::types::serialisable::BeanstalkSerialisable;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParsingError {
-    BadFormat,
-    UnknownCommand,
-}
-
-impl fmt::Display for ParsingError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
-            Self::BadFormat => "bad format",
-            Self::UnknownCommand => "unknown command",
-        })
-    }
-}
-
-impl BeanstalkSerialisable for ParsingError {
-    fn serialise_beanstalk(&self) -> Vec<u8> {
-        match self {
-            ParsingError::BadFormat => b"BAD_FORMAT\r\n".to_vec(),
-            ParsingError::UnknownCommand => b"UNKNOWN_COMMAND\r\n".to_vec(),
-        }
-    }
-}
+use super::protocol::{Command, Response};
 
 /// Provides a custom, minimal, zero-copy parser of byte slices.
 struct ParseState<'a> {
@@ -35,28 +9,28 @@ struct ParseState<'a> {
 
 impl ParseState<'_> {
     /// Asserts there's no more input to take, returning `result` if so, and a
-    /// `BadFormat` error otherwise.
-    fn expect_done_and<R>(&self, result: R) -> Result<R, ParsingError> {
+    /// [`ParsingError::BadFormat`] error otherwise.
+    fn expect_done_and<R>(&self, result: R) -> Result<R, Response> {
         if self.from.len() == 0 {
             Ok(result)
         } else {
-            Err(ParsingError::BadFormat)
+            Err(Response::BadFormat)
         }
     }
 
     /// Consumes from the input, expecting a token of non-zero length.
-    fn expect_next_token(&mut self) -> Result<&[u8], ParsingError> {
-        let token = self.next_token().ok_or(ParsingError::BadFormat)?;
+    fn expect_next_token(&mut self) -> Result<&[u8], Response> {
+        let token = self.next_token().ok_or(Response::BadFormat)?;
 
         if token.len() == 0 {
-            Err(ParsingError::BadFormat)
+            Err(Response::BadFormat)
         } else {
             Ok(token)
         }
     }
 
     /// Consumes from the input, expecting a space then a u32.
-    fn expect_next_u32(&mut self) -> Result<u32, ParsingError> {
+    fn expect_next_u32(&mut self) -> Result<u32, Response> {
         self.expect_space()?;
 
         let token = self.expect_next_token()?;
@@ -67,11 +41,11 @@ impl ParseState<'_> {
                 b'0'..=b'9' => {
                     r = r
                         .checked_mul(10)
-                        .ok_or(ParsingError::BadFormat)?
+                        .ok_or(Response::BadFormat)?
                         .checked_add((*v - b'0') as u32)
-                        .ok_or(ParsingError::BadFormat)?
+                        .ok_or(Response::BadFormat)?
                 },
-                _ => return Err(ParsingError::BadFormat),
+                _ => return Err(Response::BadFormat),
             };
         }
 
@@ -79,7 +53,7 @@ impl ParseState<'_> {
     }
 
     /// Consumes from the input, expecting a space then a u64.
-    fn expect_next_u64(&mut self) -> Result<u64, ParsingError> {
+    fn expect_next_u64(&mut self) -> Result<u64, Response> {
         self.expect_space()?;
 
         let token = self.expect_next_token()?;
@@ -90,11 +64,11 @@ impl ParseState<'_> {
                 b'0'..=b'9' => {
                     r = r
                         .checked_mul(10)
-                        .ok_or(ParsingError::BadFormat)?
+                        .ok_or(Response::BadFormat)?
                         .checked_add((*v - b'0') as u64)
-                        .ok_or(ParsingError::BadFormat)?
+                        .ok_or(Response::BadFormat)?
                 },
-                _ => return Err(ParsingError::BadFormat),
+                _ => return Err(Response::BadFormat),
             };
         }
 
@@ -102,7 +76,7 @@ impl ParseState<'_> {
     }
 
     /// Consumes from the input, expecting a space then a name.
-    fn expect_next_name(&mut self) -> Result<Vec<u8>, ParsingError> {
+    fn expect_next_name(&mut self) -> Result<Vec<u8>, Response> {
         self.expect_space()?;
 
         let token = self.expect_next_token()?;
@@ -126,18 +100,18 @@ impl ParseState<'_> {
         {
             Ok(r)
         } else {
-            Err(ParsingError::BadFormat)
+            Err(Response::BadFormat)
         }
     }
 
     /// Consumes a space.
-    fn expect_space(&mut self) -> Result<(), ParsingError> {
+    fn expect_space(&mut self) -> Result<(), Response> {
         match self.from.get(0) {
             Some(b' ') => {
                 self.from = &self.from[1..];
                 Ok(())
             },
-            _ => Err(ParsingError::BadFormat),
+            _ => Err(Response::BadFormat),
         }
     }
 
@@ -169,11 +143,11 @@ impl<'a> From<&'a [u8]> for ParseState<'a> {
 }
 
 // Parsing is implemented to fulfil the TryFrom trait.
-impl TryFrom<&[u8]> for BeanstalkCommand {
-    type Error = ParsingError;
+impl TryFrom<&[u8]> for Command {
+    type Error = Response;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        use BeanstalkCommand::*;
+        use Command::*;
 
         let mut ps: ParseState = value.into();
 
@@ -258,7 +232,7 @@ impl TryFrom<&[u8]> for BeanstalkCommand {
                 n_bytes: ps.expect_next_u32()?,
             },
 
-            _ => return Err(ParsingError::UnknownCommand),
+            _ => return Err(Response::UnknownCommand),
         };
 
         ps.expect_done_and(cmd)
@@ -271,34 +245,28 @@ mod tests {
 
     #[test]
     fn test_parse_command() {
-        use BeanstalkCommand::*;
-        use ParsingError::*;
+        use Command::*;
+        use Response::*;
 
         const U32_MAX_PLUS_1: u128 = 1 << 32 + 1;
         const U64_MAX_PLUS_1: u128 = 1 << 64 + 1;
 
         // Asserts the line parses into the given command successfully.
         #[track_caller]
-        fn ok(line: &[u8], res: BeanstalkCommand) {
+        fn ok(line: &[u8], res: Command) {
             assert_eq!(line.try_into(), Ok(res));
         }
 
         // Asserts the line fails to parse with a BadFormat error.
         #[track_caller]
         fn bf(line: &[u8]) {
-            assert_eq!(
-                TryInto::<BeanstalkCommand>::try_into(line),
-                Err(BadFormat)
-            );
+            assert_eq!(TryInto::<Command>::try_into(line), Err(BadFormat));
         }
 
         // Asserts the line fails to parse with an UnknownCommand error.
         #[track_caller]
         fn uc(line: &[u8]) {
-            assert_eq!(
-                TryInto::<BeanstalkCommand>::try_into(line),
-                Err(UnknownCommand)
-            );
+            assert_eq!(TryInto::<Command>::try_into(line), Err(UnknownCommand));
         }
 
         let name_200_bytes: String =

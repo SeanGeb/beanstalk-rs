@@ -1,13 +1,15 @@
-use std::time::Instant;
+use tokio::time::Instant;
 
 use serde::Serialize;
 
-#[derive(Debug)]
-pub(crate) enum JobState {
-    Ready,
+use super::tube::{BuriedPos, ReadyPos};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JobState {
+    Ready { pos: ReadyPos },
     Delayed { until: Instant },
-    Reserved { at: Instant },
-    Buried,
+    Reserved { deadline: Instant },
+    Buried { pos: BuriedPos },
 }
 
 // This impl is used to allow JobStats to be serialised to YAML.
@@ -19,10 +21,10 @@ impl Serialize for JobState {
         use JobState::*;
 
         serializer.serialize_str(match self {
-            Ready => "ready",
-            Delayed { until: _ } => "delayed",
-            Reserved { at: _ } => "reserved",
-            Buried => "buried",
+            Ready { .. } => "ready",
+            Delayed { .. } => "delayed",
+            Reserved { .. } => "reserved",
+            Buried { .. } => "buried",
         })
     }
 }

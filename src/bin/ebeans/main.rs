@@ -2,21 +2,20 @@ mod args;
 
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use enchanted_beans::line_reader::LineReader;
-use enchanted_beans::parser::ParsingError;
-use enchanted_beans::types::protocol::BeanstalkCommand;
-use enchanted_beans::types::serialisable::BeanstalkSerialisable;
-use enchanted_beans::util::bytes_to_human_str;
+use futures::sink::SinkExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::{select, signal};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, trace, warn, Level};
+use tracing::{debug, error, info, instrument, warn, Level};
 
 use crate::args::Args;
+use beanstalk_rs::wire::events::BeanstalkClientEvent;
+use beanstalk_rs::wire::{self, decoder};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -37,7 +36,7 @@ async fn main() -> ExitCode {
     }
 
     // Cancellation and termination channel.
-    // TODO: this termination channel is a mpsc - so could be used when
+    // TODO: this termination channel is a mpsc - so could be repurposed when
     // implementing durability as a stream of events.
     let cancel = CancellationToken::new();
     {
@@ -60,112 +59,117 @@ async fn main() -> ExitCode {
 
     let (shutdown_hold, mut shutdown_wait) = mpsc::channel::<()>(1);
 
-    let exit_code = match begin(cancel, shutdown_hold, listener).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            error!(%error, "encountered runtime error");
-            ExitCode::FAILURE
-        },
-    };
+    let exit_code =
+        match accept_loop(cancel, shutdown_hold, listener, args.max_job_size)
+            .await
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                error!(%error, "encountered runtime error");
+                ExitCode::FAILURE
+            },
+        };
 
     shutdown_wait.recv().await;
 
     exit_code
 }
 
-async fn begin(
+async fn accept_loop(
     cancel: CancellationToken,
     shutdown_hold: mpsc::Sender<()>,
     listener: TcpListener,
+    max_job_size: u32,
 ) -> Result<()> {
     info!(addr = %listener.local_addr()?, "listening");
 
     // Accept incoming connections until an exit signal is sent, and handle each
     // connection as its own task.
     loop {
-        let conn = match select! {
+        match select! {
             accept = listener.accept() => accept,
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => return Ok(()),
         } {
-            Ok((conn, _)) => conn,
+            Ok((conn, _)) => {
+                tokio::spawn(do_client_loop(
+                    cancel.clone(),
+                    shutdown_hold.clone(),
+                    conn,
+                    max_job_size,
+                ));
+            },
             Err(error) => {
                 warn!(%error, "failed to accept connection");
                 continue;
             },
         };
-
-        tokio::spawn(begin_handle(cancel.clone(), shutdown_hold.clone(), conn));
     }
-
-    Ok(())
 }
 
-#[instrument(name = "handle", err, fields(peer = %conn.peer_addr()?), skip_all)]
-async fn begin_handle(
+#[instrument(name = "client_loop", err(level = Level::WARN), fields(peer = %conn.peer_addr()?), skip_all)]
+async fn do_client_loop(
     cancel: CancellationToken,
     _shutdown_hold: mpsc::Sender<()>,
-    mut conn: TcpStream,
+    conn: TcpStream,
+    max_job_size: u32,
 ) -> Result<()> {
+    use wire::protocol::*;
+
     debug!("accepted connection");
 
     conn.set_nodelay(true).context("setting NODELAY")?;
 
-    let ret = handle_conn(cancel, &mut conn).await;
+    let mut framed = wire::framed(conn);
 
-    conn.shutdown().await.context("during shutdown")?;
-
-    debug!("closed connection");
-
-    ret
-}
-
-async fn handle_conn(
-    cancel: CancellationToken,
-    conn: &mut TcpStream,
-) -> Result<()> {
-    // Split conn into read and write halves, where the read half uses our
-    // LineReader.
-    let (r, mut w) = conn.split();
-    let mut r: LineReader<_> = r.into();
-
-    // Keep taking lines and parsing and processing them.
-    loop {
-        let line = select!(
-           x = r.read_line() => match x? {
-                Some(x) => x,
-                None => return Ok(()),
-           },
-           _ = cancel.cancelled() => return Ok(()),
-        );
-
-        trace!(line = bytes_to_human_str(&line), "processing command");
-
-        let cmd: Result<BeanstalkCommand, ParsingError> =
-            (&line as &[u8]).try_into();
-
-        // Slightly convoluted, but ensures we write out the buffer properly
-        // with cancel safety.
-        match cmd {
-            Ok(_cmd) => select! {
-                x = w.write_all(b"CMD_OK\r\n") => x,
-                _ = cancel.cancelled() => return Ok(()),
+    let conn_result = loop {
+        let evt = select! {
+            x = framed.next() => match x {
+                None => {
+                    debug!("connection dropped");
+                    break Ok(())
+                },
+                Some(r) => r,
             },
-            Err(error) => {
-                let resp = error.serialise_beanstalk();
-                select! {
-                    x = w.write_all(&resp) => x,
-                    _ = cancel.cancelled() => return Ok(()),
-                }
-            },
-        }?;
-
-        // Flush any buffered packets once we've written out the one or more
-        // responses. This provides a pipelined response to a pipelined request.
-        // NB: flush() appears not to be implemented for TCPStreams, but this
-        // should provide forward-compatibility for other transports.
-        select! {
-            x = w.flush() => x?,
-            _ = cancel.cancelled() => return Ok(()),
+            _ = cancel.cancelled() => break Ok(()),
         };
-    }
+
+        let evt = match evt {
+            Ok(BeanstalkClientEvent::Discarded) => continue,
+            Ok(e) => e,
+            Err(decoder::Error::IO(e)) => break Err(e.into()),
+            Err(decoder::Error::Client(resp)) => {
+                // Decoder says to send a particular response to the client
+                select! {
+                    x = framed.send(resp) => x?,
+                    _ = cancel.cancelled() => break Ok(()),
+                }
+
+                break Err(anyhow!(
+                    "client sent bad request and was disconnected"
+                ));
+            },
+        };
+
+        let BeanstalkClientEvent::Command(cmd) = evt else {
+            framed.send(Response::BadFormat).await?;
+            continue;
+        };
+
+        let resp = match cmd {
+            _ => Response::InternalError,
+        };
+
+        select! {
+            x = framed.send(resp) => x?,
+            _ = cancel.cancelled() => break Ok(()),
+        }
+    };
+
+    framed
+        .into_inner()
+        .shutdown()
+        .await
+        .context("during shutdown")?;
+
+    conn_result
 }

@@ -1,11 +1,12 @@
+use bytes::Bytes;
 use serde::Serialize;
 
-use super::serialisable::BeanstalkSerialisable;
-use super::states::JobState;
+use crate::types::states::JobState;
+use crate::types::tube::TubeStats;
 
 /// A command sent by the client to the server.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BeanstalkCommand {
+pub enum Command {
     /// Places a job onto the currently `use`d queue.
     ///
     /// On the wire: `put <pri> <delay> <ttr>`
@@ -151,7 +152,8 @@ pub enum BeanstalkCommand {
 }
 
 /// All possible response types to a `BeanstalkRequest`.
-pub enum BeanstalkResponse {
+#[derive(Debug, PartialEq)]
+pub enum Response {
     /// Indicates the server cannot handle a job due to memory pressure. Can be
     /// sent in response to any command.
     ///
@@ -216,10 +218,18 @@ pub enum BeanstalkResponse {
     /// On the wire: `TIMED_OUT`.
     TimedOut,
     /// In response to a `reserve`, `reserve-with-timeout`, or `reserve-job`,
-    /// provides the ID and data of the job that was just reserved.
+    /// provides the ID and of the job that was just reserved.
     ///
-    /// On the wire: `RESERVED <id> <n_bytes>` plus data.
-    Reserved { id: u64, data: Vec<u8> },
+    /// On the wire: `RESERVED <id> <n_bytes>`.
+    Reserved { id: u64 },
+    /// In response to a `peek`-family command, indicates success.
+    ///
+    /// On the wire: `FOUND <id> <n_bytes>`.
+    Found { id: u64 },
+    /// After a Reserved or Found message, a chunk of the job data
+    JobChunk(Bytes),
+    /// Ends a job
+    JobEnd,
     /// In response to any of the following commands, indicates a general state
     /// where a specific job isn't known to the server, or doesn't satisfy
     /// a precondition to be returned by the command.
@@ -270,10 +280,6 @@ pub enum BeanstalkResponse {
     ///
     /// On the wire: `NOT_IGNORED`.
     NotIgnored,
-    /// In response to a `peek`-family command, indicates success.
-    ///
-    /// On the wire: `FOUND <id> <n_bytes>` plus data.
-    Found { id: u64, data: Vec<u8> },
     /// In response to a `kick`, indicates success with the number of jobs
     /// kicked from the buried xor delayed states.
     ///
@@ -294,7 +300,7 @@ pub enum BeanstalkResponse {
     ///In response to a `stats-tube`, indicates success.
     ///
     /// On the wire: `OK <n_bytes>` plus data in YAML dictionary format.
-    OkStatsTube { data: TubeStats },
+    OkStatsTube { data: TubeStatsResp },
     ///In response to a `list-tubes` or `list-tubes-watched`, indicates success.
     ///
     /// On the wire: `OK <n_bytes>` plus data in YAML *list* format.
@@ -305,299 +311,204 @@ pub enum BeanstalkResponse {
     Paused,
 }
 
-impl BeanstalkSerialisable for BeanstalkResponse {
-    fn serialise_beanstalk(&self) -> Vec<u8> {
-        use BeanstalkResponse::*;
-
-        match self {
-            OutOfMemory => b"OUT_OF_MEMORY\r\n".to_vec(),
-            InternalError => b"INTERNAL_ERROR\r\n".to_vec(),
-            BadFormat => b"BAD_FORMAT\r\n".to_vec(),
-            UnknownCommand => b"UNKNOWN_COMMAND\r\n".to_vec(),
-            Inserted { id } => format!("INSERTED {id}\r\n").into(),
-            BuriedID { id } => format!("BURIED {id}\r\n").into(),
-            ExpectedCRLF => b"EXPECTED_CRLF\r\n".to_vec(),
-            JobTooBig => b"JOB_TOO_BIG\r\n".to_vec(),
-            Draining => b"DRAINING\r\n".to_vec(),
-            Using { tube } => {
-                [b"USING ".to_vec(), tube.to_owned(), b"\r\n".to_vec()].concat()
-            },
-            DeadlineSoon => b"DEADLINE_SOON\r\n".to_vec(),
-            TimedOut => b"TIMED_OUT\r\n".to_vec(),
-            Reserved { id, data } => [
-                format!("RESERVED {id} {}\r\n", data.len()).into_bytes(),
-                data.to_owned(), // TODO: reduce copying
-                b"\r\n".to_vec(),
-            ]
-            .concat(),
-            NotFound => b"NOT_FOUND\r\n".to_vec(),
-            Released => b"RELEASED\r\n".to_vec(),
-            Watching { count } => format!("WATCHING {count}\r\n").into(),
-            NotIgnored => b"NOT_IGNORED\r\n".to_vec(),
-            Found { id, data } => {
-                [
-                    format!("FOUND {id} {}\r\n", data.len()).into(),
-                    data.to_owned(), // TODO: reduce copying
-                    b"\r\n".to_vec(),
-                ]
-                .concat()
-            },
-            KickedCount { count } => format!("KICKED {count}\r\n").into(),
-            Kicked => b"KICKED\r\n".to_vec(),
-            OkStatsJob { data } => {
-                let data = serde_yaml::to_string(data).unwrap();
-                format!("OK {}\r\n{data}\r\n", data.len()).into()
-            },
-            OkStats { data } => {
-                let data = serde_yaml::to_string(data).unwrap();
-                format!("OK {}\r\n{data}\r\n", data.len()).into()
-            },
-            OkListTubes { tubes } => {
-                let data = serde_yaml::to_string(tubes).unwrap();
-                format!("OK {}\r\n{data}\r\n", data.len()).into()
-            },
-            Paused => b"PAUSED\r\n".to_vec(),
-            Deleted => b"DELETED\r\n".to_vec(),
-            Buried => b"BURIED\r\n".to_vec(),
-            Touched => b"TOUCHED\r\n".to_vec(),
-            OkStatsTube { data } => {
-                let data = serde_yaml::to_string(data).unwrap();
-                format!("OK {}\r\n{data}\r\n", data.len()).into()
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct JobStats {
     /// job ID
-    pub(crate) id: u64,
+    id: u64,
     /// tube containing job
-    pub(crate) tube: Vec<u8>,
+    tube: Vec<u8>,
     /// job state
-    pub(crate) state: JobState,
+    state: JobState,
     /// priority set by last put/release/bury
-    pub(crate) pri: u32,
+    pri: u32,
 
     /// time in seconds since creation
-    pub(crate) age: u32, // TODO: size
+    age: u32, // TODO: size
     /// seconds remaining until ready
-    pub(crate) delay: u32, // TODO: size
+    delay: u32, // TODO: size
     /// allowed processing time in seconds
-    pub(crate) ttr: u32, // TODO: size
+    ttr: u32, // TODO: size
     /// time until job returns to ready queue
     #[serde(rename = "time-left")]
-    pub(crate) time_left: u32, // TODO: size
+    time_left: u32, // TODO: size
 
     /// earliest binlog file containing job
-    pub(crate) file: u32, // TODO: size
+    file: u32, // TODO: size
 
     /// number of times job reserved
-    pub(crate) reserves: u64, // TODO: size
+    reserves: u64, // TODO: size
     /// number of times job timed out
-    pub(crate) timeouts: u64, // TODO: size
+    timeouts: u64, // TODO: size
     /// number of times job released
-    pub(crate) releases: u64, // TODO: size
+    releases: u64, // TODO: size
     /// number of times job buried
-    pub(crate) buries: u64, // TODO: size
+    buries: u64, // TODO: size
     /// number of times job kicked
-    pub(crate) kicks: u64, // TODO: size
+    kicks: u64, // TODO: size
 }
 
-#[derive(Debug, Serialize)]
-pub struct TubeStats {
+#[derive(Debug, PartialEq, Serialize)]
+pub struct TubeStatsResp {
     /// tube name
-    pub(crate) name: Vec<u8>,
-    /// number of jobs in ready state with priority < 1024
-    #[serde(rename = "current-jobs-urgent")]
-    pub(crate) current_jobs_urgent: u64,
-    /// number of jobs in ready state
-    #[serde(rename = "current-jobs-ready")]
-    pub(crate) current_jobs_ready: u64,
-    /// number of jobs reserved by clients
-    #[serde(rename = "current-jobs-reserved")]
-    pub(crate) current_jobs_reserved: u64,
-    /// number of jobs in delayed state
-    #[serde(rename = "current-jobs-delayed")]
-    pub(crate) current_jobs_delayed: u64,
-    /// number of jobs in buried state
-    #[serde(rename = "current-jobs-buried")]
-    pub(crate) current_jobs_buried: u64,
-    /// total jobs created in this tube
-    #[serde(rename = "total-jobs")]
-    pub(crate) total_jobs: u64,
-    /// number of clients that have `use`d this queue
-    #[serde(rename = "current-using")]
-    pub(crate) current_using: u64,
-    /// number of clients that have `watch`ed this queue and are waiting on a
-    /// `reserve`
-    #[serde(rename = "current-waiting")]
-    pub(crate) current_waiting: u64,
-    /// number of clients that have `watch`ed this queue
-    #[serde(rename = "current-watching")]
-    pub(crate) current_watching: u64,
-    /// number of seconds this queue has been paused for in total
-    pub(crate) pause: u32,
-    /// number of `delete` commands issued for this tube
-    #[serde(rename = "cmd-delete")]
-    pub(crate) cmd_delete: u64,
-    /// number of `pause-tube` commands issued for this tube
-    #[serde(rename = "cmd-pause-tube")]
-    pub(crate) cmd_pause_tube: u64,
+    name: Vec<u8>,
+    #[serde(flatten)]
+    ts: TubeStats,
     /// seconds remaining until the queue is un-paused.
     #[serde(rename = "pause-time-left")]
-    pub(crate) pause_time_left: u32,
+    pause_time_left: u32,
 }
 
-#[derive(Debug, Serialize)]
+// TODO: decompose into component structs
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ServerStats {
     /// number of ready jobs with priority < 1024
     #[serde(rename = "current-jobs-urgent")]
-    pub(crate) current_jobs_urgent: u64,
+    current_jobs_urgent: u64,
     /// number of jobs in the ready queue
     #[serde(rename = "current-jobs-ready")]
-    pub(crate) current_jobs_ready: u64,
+    current_jobs_ready: u64,
     /// number of jobs reserved by all clients
     #[serde(rename = "current-jobs-reserved")]
-    pub(crate) current_jobs_reserved: u64,
+    current_jobs_reserved: u64,
     /// number of delayed jobs
     #[serde(rename = "current-jobs-delayed")]
-    pub(crate) current_jobs_delayed: u64,
+    current_jobs_delayed: u64,
     /// number of buried jobs
     #[serde(rename = "current-jobs-buried")]
-    pub(crate) current_jobs_buried: u64,
+    current_jobs_buried: u64,
 
     /// number of X commands
     #[serde(rename = "cmd-put")]
-    pub(crate) cmd_put: u64,
+    cmd_put: u64,
     /// number of X commands
     #[serde(rename = "cmd-peek")]
-    pub(crate) cmd_peek: u64,
+    cmd_peek: u64,
     /// number of X commands
     #[serde(rename = "cmd-peek-ready")]
-    pub(crate) cmd_peek_ready: u64,
+    cmd_peek_ready: u64,
     /// number of X commands
     #[serde(rename = "cmd-peek-delayed")]
-    pub(crate) cmd_peek_delayed: u64,
+    cmd_peek_delayed: u64,
     /// number of X commands
     #[serde(rename = "cmd-peek-buried")]
-    pub(crate) cmd_peek_buried: u64,
+    cmd_peek_buried: u64,
     /// number of X commands
     #[serde(rename = "cmd-reserve")]
-    pub(crate) cmd_reserve: u64,
+    cmd_reserve: u64,
     /// number of X commands
     #[serde(rename = "cmd-reserve-with-timeout")]
-    pub(crate) cmd_reserve_with_timeout: u64,
+    cmd_reserve_with_timeout: u64,
     /// number of X commands
     #[serde(rename = "cmd-touch")]
-    pub(crate) cmd_touch: u64,
+    cmd_touch: u64,
     /// number of X commands
     #[serde(rename = "cmd-use")]
-    pub(crate) cmd_use: u64,
+    cmd_use: u64,
     /// number of X commands
     #[serde(rename = "cmd-watch")]
-    pub(crate) cmd_watch: u64,
+    cmd_watch: u64,
     /// number of X commands
     #[serde(rename = "cmd-ignore")]
-    pub(crate) cmd_ignore: u64,
+    cmd_ignore: u64,
     /// number of X commands
     #[serde(rename = "cmd-delete")]
-    pub(crate) cmd_delete: u64,
+    cmd_delete: u64,
     /// number of X commands
     #[serde(rename = "cmd-release")]
-    pub(crate) cmd_release: u64,
+    cmd_release: u64,
     /// number of X commands
     #[serde(rename = "cmd-bury")]
-    pub(crate) cmd_bury: u64,
+    cmd_bury: u64,
     /// number of X commands
     #[serde(rename = "cmd-kick")]
-    pub(crate) cmd_kick: u64,
+    cmd_kick: u64,
     /// number of X commands
     #[serde(rename = "cmd-stats")]
-    pub(crate) cmd_stats: u64,
+    cmd_stats: u64,
     /// number of X commands
     #[serde(rename = "cmd-stats-job")]
-    pub(crate) cmd_stats_job: u64,
+    cmd_stats_job: u64,
     /// number of X commands
     #[serde(rename = "cmd-stats-tube")]
-    pub(crate) cmd_stats_tube: u64,
+    cmd_stats_tube: u64,
     /// number of X commands
     #[serde(rename = "cmd-list-tubes")]
-    pub(crate) cmd_list_tubes: u64,
+    cmd_list_tubes: u64,
     /// number of X commands
     #[serde(rename = "cmd-list-tube-used")]
-    pub(crate) cmd_list_tube_used: u64,
+    cmd_list_tube_used: u64,
     /// number of X commands
     #[serde(rename = "cmd-list-tubes-watched")]
-    pub(crate) cmd_list_tubes_watched: u64,
+    cmd_list_tubes_watched: u64,
     /// number of X commands
     #[serde(rename = "cmd-pause-tube")]
-    pub(crate) cmd_pause_tube: u64,
+    cmd_pause_tube: u64,
 
     /// cumulative count of times a job has timed out
     #[serde(rename = "job-timeouts")]
-    pub(crate) job_timeouts: u64,
+    job_timeouts: u64,
     /// cumulative count of jobs created
     #[serde(rename = "total-jobs")]
-    pub(crate) total_jobs: u64,
+    total_jobs: u64,
     /// maximum number of bytes in a job
     #[serde(rename = "max-job-size")]
-    pub(crate) max_job_size: u64,
+    max_job_size: u64,
     /// number of currently-existing tubes
     #[serde(rename = "current-tubes")]
-    pub(crate) current_tubes: u64,
+    current_tubes: u64,
     /// number of currently open connections
     #[serde(rename = "current-connections")]
-    pub(crate) current_connections: u64,
+    current_connections: u64,
     /// number of open connections that have each issued at least one put command
     #[serde(rename = "current-producers")]
-    pub(crate) current_producers: u64,
+    current_producers: u64,
     /// number of open connections that have each issued at least one reserve command
     #[serde(rename = "current-workers")]
-    pub(crate) current_workers: u64,
+    current_workers: u64,
     /// number of open connections that have issued a reserve command but not yet received a response
     #[serde(rename = "current-waiting")]
-    pub(crate) current_waiting: u64,
+    current_waiting: u64,
     /// cumulative count of connections
     #[serde(rename = "total-connections")]
-    pub(crate) total_connections: u64,
+    total_connections: u64,
     /// process id of the server
-    pub(crate) pid: u32,
+    pid: u32,
     /// version string of the server
-    pub(crate) version: &'static str,
+    version: &'static str,
     /// cumulative user CPU time of this process in seconds and microseconds
     #[serde(rename = "rusage-utime")]
-    pub(crate) rusage_utime: u64,
+    rusage_utime: u64,
     /// cumulative system CPU time of this process in seconds and microseconds
     #[serde(rename = "rusage-stime")]
-    pub(crate) rusage_stime: u64,
+    rusage_stime: u64,
     /// number of seconds since this server process started running
-    pub(crate) uptime: u32,
+    uptime: u32,
 
     /// index of the oldest binlog file needed to store the current jobs
     #[serde(rename = "binlog-oldest-index")]
-    pub(crate) binlog_oldest_index: u64,
+    binlog_oldest_index: u64,
     /// index of the current binlog file being written to. If binlog is not active this value will be 0
     #[serde(rename = "binlog-current-index")]
-    pub(crate) binlog_current_index: u64,
+    binlog_current_index: u64,
     /// maximum size in bytes a binlog file is allowed to get before a new binlog file is opened
     #[serde(rename = "binlog-max-size")]
-    pub(crate) binlog_max_size: u64,
+    binlog_max_size: u64,
     /// cumulative number of records written to the binlog
     #[serde(rename = "binlog-records-written")]
-    pub(crate) binlog_records_written: u64,
+    binlog_records_written: u64,
     /// cumulative number of records written as part of compaction
     #[serde(rename = "binlog-records-migrated")]
-    pub(crate) binlog_records_migrated: u64,
+    binlog_records_migrated: u64,
 
     /// is server is in drain mode
-    pub(crate) draining: bool,
-    /// random id string for this server process, generated every time beanstalkd process starts
-    pub(crate) id: Vec<u8>,
+    draining: bool,
+    /// random id string for this server process, generated every time the
+    /// process starts
+    id: Vec<u8>,
     // hostname of the machine as determined by uname
-    pub(crate) hostname: Vec<u8>,
+    hostname: Vec<u8>,
     /// OS version as determined by uname
-    pub(crate) os: Vec<u8>,
-    // machine architecture as determined by uname
-    pub(crate) platform: Vec<u8>,
+    os: Vec<u8>,
+    /// machine architecture as determined by uname
+    platform: Vec<u8>,
 }
